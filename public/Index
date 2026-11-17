@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Watch Party</title>
+<style>
+  :root { --bg:#0a0a0a; --panel:#161114; --text:#fdeef4; --muted:#b894a4; --accent:#f8c8dc; --border:#2e2229; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,-apple-system,Segoe UI,sans-serif; background:var(--bg); color:var(--text); }
+  button, input { font:inherit; }
+  input { background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:8px; padding:10px 12px; }
+  input:focus { outline:1px solid var(--accent); }
+  button { background:var(--accent); color:#0a0a0a; font-weight:600; border:0; border-radius:8px; padding:10px 16px; cursor:pointer; }
+  button.ghost { background:var(--panel); color:var(--accent); border:1px solid var(--border); }
+  .center { min-height:100vh; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; padding:20px; text-align:center; }
+  h1, h2 { color:var(--accent); margin:0; }
+  .hidden { display:none !important; }
+  #app { display:grid; grid-template-columns:1fr 340px; gap:16px; padding:16px; height:100vh; }
+  #left { display:flex; flex-direction:column; gap:12px; min-width:0; overflow-y:auto; }
+  #playerWrap { position:relative; width:100%; aspect-ratio:16/9; background:#000; border-radius:12px; overflow:hidden; border:1px solid var(--border); }
+  #playerWrap > div, #playerWrap iframe { position:absolute; inset:0; width:100%; height:100%; }
+  .row { display:flex; gap:8px; }
+  .row input { flex:1; min-width:0; }
+  .list { display:flex; flex-direction:column; gap:6px; }
+  .item { display:flex; align-items:center; gap:10px; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:6px; }
+  .item img { width:96px; border-radius:4px; flex-shrink:0; }
+  .item .info { flex:1; min-width:0; font-size:13px; }
+  .item .info b { display:block; color:var(--text); font-weight:600; overflow:hidden; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; }
+  .item .info span { color:var(--muted); font-size:12px; }
+  .item .btns { display:flex; flex-direction:column; gap:4px; }
+  .item button { padding:4px 10px; font-size:12px; }
+  .note { color:var(--muted); font-size:13px; }
+  #side { display:flex; flex-direction:column; background:var(--panel); border:1px solid var(--border); border-radius:12px; min-height:0; }
+  #sideHead { padding:12px 14px; border-bottom:1px solid var(--border); font-size:14px; color:var(--accent); font-weight:600; }
+  #sideHead small { color:var(--muted); display:block; margin-top:2px; font-weight:400; }
+  #messages { flex:1; overflow-y:auto; padding:12px 14px; display:flex; flex-direction:column; gap:8px; }
+  .msg { font-size:14px; line-height:1.35; word-break:break-word; }
+  .msg b { color:var(--accent); }
+  .msg.sys { color:var(--muted); font-size:12px; font-style:italic; }
+  #chatForm { padding:10px; border-top:1px solid var(--border); }
+  h3 { margin:4px 0; font-size:14px; color:var(--muted); font-weight:600; }
+  @media (max-width:800px) {
+    #app { grid-template-columns:1fr; height:auto; }
+    #side { height:380px; }
+  }
+</style>
+</head>
+<body>
+
+<div id="landing" class="center hidden">
+  <h1>Watch Party</h1>
+  <p class="note" style="max-width:360px">Create a room, share the link, and watch YouTube together in sync with live chat.</p>
+  <button id="createBtn">Create a room</button>
+</div>
+
+<div id="join" class="center hidden">
+  <h2>Join the room</h2>
+  <input id="nameInput" placeholder="Your name" maxlength="24">
+  <button id="joinBtn">Join</button>
+</div>
+
+<div id="app" class="hidden">
+  <div id="left">
+    <div id="playerWrap"><div id="player"></div></div>
+    <form id="searchForm" class="row">
+      <input id="urlInput" placeholder="Search YouTube or paste a link" autocomplete="off">
+      <button>Search</button>
+    </form>
+    <div id="results" class="list"></div>
+    <div class="row">
+      <button id="copyBtn" class="ghost">Copy room link</button>
+    </div>
+    <h3>Up next</h3>
+    <div id="queue" class="list"></div>
+  </div>
+  <div id="side">
+    <div id="sideHead">Chat<small id="users"></small></div>
+    <div id="messages"></div>
+    <form id="chatForm" class="row">
+      <input id="chatInput" placeholder="Say something…" autocomplete="off" maxlength="500">
+      <button>Send</button>
+    </form>
+  </div>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="https://www.youtube.com/iframe_api"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const roomId = location.pathname.startsWith('/room/') ? location.pathname.split('/')[2] : null;
+
+if (!roomId) {
+  $('landing').classList.remove('hidden');
+  $('createBtn').onclick = () => {
+    const id = Math.random().toString(36).slice(2, 8);
+    location.href = '/room/' + id;
+  };
+} else {
+  $('join').classList.remove('hidden');
+  $('nameInput').value = localStorage.getItem('wp-name') || '';
+}
+
+let socket, player, playerReady = false, pendingInit = null;
+let currentId = null, ignore = false, ignoreTimer = null;
+
+function muteEvents(ms = 1200) {
+  ignore = true;
+  clearTimeout(ignoreTimer);
+  ignoreTimer = setTimeout(() => (ignore = false), ms);
+}
+
+function parseId(url) {
+  const m = url.match(/(?:youtu\.be\/|v=|embed\/|shorts\/)([\w-]{11})/);
+  return m ? m[1] : null;
+}
+
+function decode(s) {
+  return new DOMParser().parseFromString(s, 'text/html').documentElement.textContent;
+}
+
+window.onYouTubeIframeAPIReady = () => {
+  player = new YT.Player('player', {
+    width: '100%', height: '100%',
+    playerVars: { playsinline: 1, rel: 0 },
+    events: {
+      onReady: () => { playerReady = true; if (pendingInit) { applyLoad(pendingInit); pendingInit = null; } },
+      onStateChange: onPlayerState,
+    },
+  });
+};
+
+function applyLoad({ videoId, time, playing }) {
+  if (!videoId) return;
+  if (!playerReady) { pendingInit = { videoId, time, playing }; return; }
+  muteEvents(2000);
+  currentId = videoId;
+  player.loadVideoById({ videoId, startSeconds: time || 0 });
+  if (!playing) setTimeout(() => player.pauseVideo(), 600);
+}
+
+function applySync({ playing, time }) {
+  if (!playerReady || !currentId) return;
+  muteEvents();
+  if (Math.abs(player.getCurrentTime() - time) > 1.5) player.seekTo(time, true);
+  if (playing) player.playVideo(); else player.pauseVideo();
+}
+
+function onPlayerState(e) {
+  if (ignore || !socket) return;
+  const t = player.getCurrentTime();
+  if (e.data === YT.PlayerState.PLAYING) socket.emit('play', { time: t });
+  else if (e.data === YT.PlayerState.PAUSED) socket.emit('pause', { time: t });
+  else if (e.data === YT.PlayerState.ENDED) socket.emit('ended', { videoId: currentId });
+}
+
+$('joinBtn').onclick = () => {
+  const name = $('nameInput').value.trim() || 'Guest';
+  localStorage.setItem('wp-name', name);
+  $('join').classList.add('hidden');
+  $('app').classList.remove('hidden');
+
+  socket = io();
+  socket.on('connect', () => socket.emit('join', { room: roomId, name }));
+  socket.on('init', (s) => { renderQueue(s.queue); if (s.videoId) applyLoad(s); });
+  socket.on('load', applyLoad);
+  socket.on('sync', applySync);
+  socket.on('queue', renderQueue);
+  socket.on('users', (u) => ($('users').textContent = u.length + ' watching: ' + u.join(', ')));
+  socket.on('chat', addMessage);
+};
+
+// Search or paste a link
+$('searchForm').onsubmit = async (e) => {
+  e.preventDefault();
+  const v = $('urlInput').value.trim();
+  if (!v) return;
+  const id = parseId(v);
+  const box = $('results');
+  if (id) {
+    socket.emit('load', { videoId: id });
+    $('urlInput').value = '';
+    box.innerHTML = '';
+    return;
+  }
+  box.innerHTML = '<span class="note">Searching…</span>';
+  try {
+    const r = await fetch('/api/search?q=' + encodeURIComponent(v));
+    const d = await r.json();
+    if (!r.ok) {
+      box.innerHTML = '<span class="note">' + (d.error === 'missing_key'
+        ? 'Search is not set up yet (missing YouTube API key).'
+        : 'Search failed, try again in a bit.') + '</span>';
+      return;
+    }
+    renderResults(d.items);
+  } catch (err) {
+    box.innerHTML = '<span class="note">Search failed, check your connection.</span>';
+  }
+};
+
+function renderResults(items) {
+  const box = $('results');
+  box.innerHTML = '';
+  if (!items.length) { box.innerHTML = '<span class="note">No results.</span>'; return; }
+  items.forEach((it) => {
+    const title = decode(it.title);
+    const el = document.createElement('div');
+    el.className = 'item';
+    const img = document.createElement('img');
+    img.src = 'https://i.ytimg.com/vi/' + it.id + '/mqdefault.jpg';
+    const info = document.createElement('div');
+    info.className = 'info';
+    const b = document.createElement('b'); b.textContent = title;
+    const s = document.createElement('span'); s.textContent = decode(it.channel);
+    info.append(b, s);
+    const btns = document.createElement('div');
+    btns.className = 'btns';
+    const play = document.createElement('button'); play.textContent = 'Play';
+    play.onclick = () => { socket.emit('load', { videoId: it.id }); $('results').innerHTML = ''; $('urlInput').value = ''; };
+    const q = document.createElement('button'); q.className = 'ghost'; q.textContent = '+ Queue';
+    q.onclick = () => { socket.emit('queue:add', { videoId: it.id, title }); q.textContent = 'Added'; };
+    btns.append(play, q);
+    el.append(img, info, btns);
+    box.appendChild(el);
+  });
+}
+
+$('copyBtn').onclick = async () => {
+  try { await navigator.clipboard.writeText(location.href); $('copyBtn').textContent = 'Copied!'; }
+  catch { prompt('Copy this link:', location.href); }
+  setTimeout(() => ($('copyBtn').textContent = 'Copy room link'), 1500);
+};
+
+function renderQueue(q) {
+  const box = $('queue');
+  box.innerHTML = '';
+  if (!q.length) { box.innerHTML = '<span class="note">Queue is empty</span>'; return; }
+  q.forEach((item, i) => {
+    const el = document.createElement('div');
+    el.className = 'item';
+    const img = document.createElement('img');
+    img.src = 'https://i.ytimg.com/vi/' + item.id + '/mqdefault.jpg';
+    const info = document.createElement('div');
+    info.className = 'info';
+    const b = document.createElement('b'); b.textContent = item.title;
+    info.appendChild(b);
+    const rm = document.createElement('button');
+    rm.className = 'ghost'; rm.textContent = '✕';
+    rm.onclick = () => socket.emit('queue:remove', { index: i });
+    el.append(img, info, rm);
+    box.appendChild(el);
+  });
+}
+
+function addMessage(m) {
+  const el = document.createElement('div');
+  el.className = 'msg' + (m.system ? ' sys' : '');
+  if (m.system) el.textContent = m.text;
+  else {
+    const b = document.createElement('b');
+    b.textContent = m.name + ': ';
+    el.appendChild(b);
+    el.appendChild(document.createTextNode(m.text));
+  }
+  const box = $('messages');
+  box.appendChild(el);
+  box.scrollTop = box.scrollHeight;
+}
+
+$('chatForm').onsubmit = (e) => {
+  e.preventDefault();
+  const text = $('chatInput').value.trim();
+  if (text) socket.emit('chat', { text });
+  $('chatInput').value = '';
+};
+</script>
+</body>
+</html>
